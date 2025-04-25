@@ -31,8 +31,13 @@ class NormalizedEnv(gym.Wrapper):
 
     def __init__(self, env):
         super().__init__(env)
-        # Extract max_episode_steps from env.spec.max_episode_steps
-        self._max_episode_steps = env.spec.max_episode_steps
+        # Extract max_episode_steps if available
+        try:
+            self._max_episode_steps = env.spec.max_episode_steps
+        except AttributeError:
+            # Try underlying env if it's a wrapper
+            spec = getattr(getattr(env, 'env', None), 'spec', None)
+            self._max_episode_steps = spec.max_episode_steps if spec is not None else None
 
         self.scale = env.action_space.high
         self.action_space.high /= self.scale
