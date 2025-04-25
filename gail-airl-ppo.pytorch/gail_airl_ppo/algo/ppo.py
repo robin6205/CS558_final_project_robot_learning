@@ -79,11 +79,22 @@ class PPO(Algorithm):
         t += 1
 
         # Check for NaN/Inf in state
-        if np.any(np.isnan(state)) or np.any(np.isinf(state)):
-            print("Warning: NaN or Inf detected in state. Replacing with zeros.")
-            state = np.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
+        if isinstance(state, tuple) and len(state) >= 1:
+            observation = state[0]  # Extract observation from tuple
+        else:
+            observation = state  # Old-style API returns just the observation
+        
+        # Check for NaN/Inf in observation
+        if np.any(np.isnan(observation)) or np.any(np.isinf(observation)):
+            print("Warning: NaN or Inf detected in observation. Replacing with zeros.")
+            observation = np.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
+            # Reconstruct state with cleaned observation
+            if isinstance(state, tuple) and len(state) >= 2:
+                state = (observation, state[1])  # Preserve info part
+            else:
+                state = observation
 
-        action, log_pi = self.explore(state)
+        action, log_pi = self.explore(observation)
         
         # Check for NaN/Inf in action
         if np.any(np.isnan(action)) or np.any(np.isinf(action)):
@@ -91,32 +102,66 @@ class PPO(Algorithm):
             action = np.random.uniform(-1, 1, size=action.shape)
             # Need to recalculate log_pi for the new action
             with torch.no_grad():
-                state_tensor = torch.tensor(state, dtype=torch.float, device=self.device)
+                state_tensor = torch.tensor(observation, dtype=torch.float, device=self.device)
                 action_tensor = torch.tensor(action, dtype=torch.float, device=self.device)
                 log_pi = self.actor.evaluate_log_pi(state_tensor.unsqueeze(0), 
                                                    action_tensor.unsqueeze(0)).item()
             
-        next_state, reward, done, info = env.step(action)
+        # Handle both old and new gym APIs
+        step_result = env.step(action)
+        
+        # New gym API returns (next_state, reward, terminated, truncated, info)
+        if len(step_result) == 5:
+            next_state, reward, terminated, truncated, info = step_result
+            done = terminated or truncated
+        # Old gym API returns (next_state, reward, done, info)
+        else:
+            next_state, reward, done, info = step_result
         
         # Check for NaN/Inf in next_state
-        if np.any(np.isnan(next_state)) or np.any(np.isinf(next_state)):
-            print("Warning: NaN or Inf detected in next_state. Replacing with zeros.")
-            next_state = np.nan_to_num(next_state, nan=0.0, posinf=0.0, neginf=0.0)
+        if isinstance(next_state, tuple) and len(next_state) >= 1:
+            next_observation = next_state[0]  # Extract observation from tuple
+        else:
+            next_observation = next_state  # Old-style API returns just the observation
+        
+        # Check for NaN/Inf in next_observation
+        if np.any(np.isnan(next_observation)) or np.any(np.isinf(next_observation)):
+            print("Warning: NaN or Inf detected in next_observation. Replacing with zeros.")
+            next_observation = np.nan_to_num(next_observation, nan=0.0, posinf=0.0, neginf=0.0)
+            # Reconstruct next_state with cleaned observation
+            if isinstance(next_state, tuple) and len(next_state) >= 2:
+                next_state = (next_observation, next_state[1])  # Preserve info part
+            else:
+                next_state = next_observation
         
         # Clip reward for stability
         reward = np.clip(reward, -10.0, 10.0)
         
         mask = False if t == env._max_episode_steps else done
 
-        self.buffer.append(state, action, reward, mask, log_pi, next_state)
+        self.buffer.append(observation, action, reward, mask, log_pi, next_observation)
 
         if done:
             t = 0
-            next_state = env.reset()
-            # Check for NaN/Inf in reset state
-            if np.any(np.isnan(next_state)) or np.any(np.isinf(next_state)):
-                print("Warning: NaN or Inf detected in reset state. Replacing with zeros.")
-                next_state = np.nan_to_num(next_state, nan=0.0, posinf=0.0, neginf=0.0)
+            # Handle both old and new gym APIs for reset
+            reset_result = env.reset()
+            # New gym API returns (next_observation, info)
+            if isinstance(reset_result, tuple) and len(reset_result) >= 1:
+                next_state = reset_result
+                # Check for NaN/Inf in reset observation
+                next_observation = next_state[0]
+                if np.any(np.isnan(next_observation)) or np.any(np.isinf(next_observation)):
+                    print("Warning: NaN or Inf detected in reset observation. Replacing with zeros.")
+                    next_observation = np.nan_to_num(next_observation, nan=0.0, posinf=0.0, neginf=0.0)
+                    # Reconstruct next_state with cleaned observation
+                    next_state = (next_observation, next_state[1]) if len(next_state) >= 2 else next_observation
+            # Old gym API returns just observation
+            else:
+                next_state = reset_result
+                # Check for NaN/Inf in reset state
+                if np.any(np.isnan(next_state)) or np.any(np.isinf(next_state)):
+                    print("Warning: NaN or Inf detected in reset state. Replacing with zeros.")
+                    next_state = np.nan_to_num(next_state, nan=0.0, posinf=0.0, neginf=0.0)
 
         return next_state, t
 

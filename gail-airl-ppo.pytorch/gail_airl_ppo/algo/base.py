@@ -18,12 +18,18 @@ class Algorithm(ABC):
         self.gamma = gamma
 
     def explore(self, state):
+        # Handle state being a tuple (observation, info) from newer Gym API
+        if isinstance(state, tuple) and len(state) >= 1:
+            state = state[0]
         state = torch.tensor(state, dtype=torch.float, device=self.device)
         with torch.no_grad():
             action, log_pi = self.actor.sample(state.unsqueeze_(0))
         return action.cpu().numpy()[0], log_pi.item()
 
     def exploit(self, state):
+        # Handle state being a tuple (observation, info) from newer Gym API
+        if isinstance(state, tuple) and len(state) >= 1:
+            state = state[0]
         state = torch.tensor(state, dtype=torch.float, device=self.device)
         with torch.no_grad():
             action = self.actor(state.unsqueeze_(0))

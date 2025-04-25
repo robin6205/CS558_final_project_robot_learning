@@ -77,7 +77,17 @@ class Trainer:
 
             while (not done):
                 action = self.algo.exploit(state)
-                state, reward, done, _ = self.env_test.step(action)
+                # Handle both old and new gym APIs
+                step_result = self.env_test.step(action)
+                
+                # New gym API returns (obs, reward, terminated, truncated, info)
+                if len(step_result) == 5:
+                    state, reward, terminated, truncated, _ = step_result
+                    done = terminated or truncated
+                # Old gym API returns (obs, reward, done, info)
+                else:
+                    state, reward, done, _ = step_result
+                
                 episode_return += reward
 
             mean_return += episode_return / self.num_eval_episodes
