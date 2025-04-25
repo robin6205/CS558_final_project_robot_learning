@@ -70,7 +70,7 @@ python train_imitation.py \
 You can visualize the trained expert:
 
 ```bash
-python visualize_policy.py --model_path logs/G1-v0/gail/seed0-20250423-0304/model/step16845000/actor.pth --num_episodes 3 --fps 5
+python visualize_policy.py --model_path logs/G1-v0/gail/seed0-20250423-0304/model/step6845000/actor.pth --num_episodes 3 --fps 5
 ```
 
 View training metrics with TensorBoard:
