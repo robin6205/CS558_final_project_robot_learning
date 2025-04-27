@@ -60,42 +60,53 @@ class Trainer:
 
             # Evaluate regularly.
             if step % self.eval_interval == 0:
-                self.evaluate(step)
+                self.evaluate()
                 self.algo.save_models(
                     os.path.join(self.model_dir, f'step{step}'))
 
         # Wait for the logging to be finished.
         sleep(10)
 
-    def evaluate(self, step):
-        mean_return = 0.0
+    def evaluate(self):
+        episodes = 0
+        num_steps = 0
+        total_return = 0.0
 
-        for _ in range(self.num_eval_episodes):
-            state = self.env_test.reset()
+        while True:
+            state, _ = self.env_test.reset()
+            episode_steps = 0
             episode_return = 0.0
             done = False
-
-            while (not done):
+            
+            while not done:
                 action = self.algo.exploit(state)
-                # Handle both old and new gym APIs
-                step_result = self.env_test.step(action)
+                next_state, reward, terminated, truncated, info = self.env_test.step(action)
+                done = terminated or truncated
                 
-                # New gym API returns (obs, reward, terminated, truncated, info)
-                if len(step_result) == 5:
-                    state, reward, terminated, truncated, _ = step_result
-                    done = terminated or truncated
-                # Old gym API returns (obs, reward, done, info)
-                else:
-                    state, reward, done, _ = step_result
-                
+                num_steps += 1
+                episode_steps += 1
                 episode_return += reward
+                state = next_state
 
-            mean_return += episode_return / self.num_eval_episodes
+            episodes += 1
+            total_return += episode_return
 
-        self.writer.add_scalar('return/test', mean_return, step)
-        print(f'Num steps: {step:<6}   '
-              f'Return: {mean_return:<5.1f}   '
-              f'Time: {self.time}')
+            if episodes >= self.num_eval_episodes:
+                break
+
+        # Log evaluation results
+        mean_return = total_return / episodes
+        mean_num_steps = num_steps / episodes
+
+        if mean_return > self.best_eval_score:
+            self.best_eval_score = mean_return
+            self.algo.save_models(os.path.join(self.log_dir, 'best'))
+            self.eval_steps += 1
+
+        # Log eval results to console
+        print(f'Evaluation: {self.eval_steps}   Mean Return: {mean_return:.2f}   Mean Num Steps: {mean_num_steps:.2f}')
+        self.writer.add_scalar('evaluate/mean_return', mean_return, self.steps)
+        self.writer.add_scalar('evaluate/mean_num_steps', mean_num_steps, self.steps)
 
     @property
     def time(self):

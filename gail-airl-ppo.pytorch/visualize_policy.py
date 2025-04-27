@@ -14,8 +14,8 @@ except ImportError:
     print("Please install with: pip install mujoco-python-viewer")
     sys.exit(1)
 
-# Import policy model
-from gail_airl_ppo.network.policy import StateIndependentPolicy
+# Import policy model - update to use the history-enabled policy
+from StateIndependentGaussianPolicy import StateIndependentGaussianPolicy
 
 # Get the absolute path of the current file's directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,18 +63,19 @@ def run(args):
     state_dim = 46  # 23 joint angles + 23 velocities
     action_dim = model.nu  # Number of actuators
     
-    # Initialize policy network
-    policy = StateIndependentPolicy(
+    # Initialize policy network with history support
+    policy = StateIndependentGaussianPolicy(
         state_shape=(state_dim,),
         action_shape=(action_dim,),
         hidden_units=(64, 64),
-        hidden_activation=torch.nn.Tanh()
+        hidden_activation=torch.nn.Tanh(),
+        history_length=args.history_length
     ).to(device)
     
     # Load policy weights
     policy.load_state_dict(torch.load(model_path, map_location=device))
     policy.eval()
-    print("Policy loaded successfully")
+    print(f"Policy loaded successfully with history_length={args.history_length}")
     
     # For debugging - print a small part of model weights
     for name, param in policy.named_parameters():
@@ -114,6 +115,10 @@ def run(args):
         data.qpos[:] = initial_qpos
         mujoco.mj_forward(model, data)
         
+        # Reset policy's state history
+        if hasattr(policy, 'state_history'):
+            policy.state_history = torch.zeros_like(policy.state_history)
+        
         # Set goal position further away from the initial position
         initial_pos = data.qpos[:3].copy()
         goal_y = initial_pos[1] + 0.4  # 0.4m ahead (changed from 0.5)
@@ -138,10 +143,23 @@ def run(args):
                 # Combine into observation
                 obs = np.concatenate([joint_angles, joint_vels])
                 
+                # Get roll and pitch for display
+                quat = data.qpos[3:7].copy()  # Quaternion orientation
+                w, x, y, z = quat
+                roll = np.arctan2(2.0 * (w*x + y*z), 1.0 - 2.0 * (x*x + y*y))
+                pitch = np.arcsin(2.0 * (w*y - z*x))
+                
+                # Get velocities for tracking display
+                vx = data.qvel[0]
+                vy = data.qvel[1]
+                vz = data.qvel[2]
+                wz = data.qvel[5]  # Yaw velocity
+                
                 # Use policy to get action
                 with torch.no_grad():
-                    obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    action_tensor = policy(obs_tensor)
+                    obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
+                    # Sample from the policy
+                    action_tensor, _ = policy.sample(obs_tensor)
                 action = action_tensor.cpu().numpy().squeeze()
                 
                 # Apply action to joint actuators
@@ -156,7 +174,7 @@ def run(args):
                 
                 # Calculate reward
                 new_root_pos = data.qpos[:3].copy()
-                root_height_z = new_root_pos[2]
+                root_height = new_root_pos[2]
                 
                 # Get torso position (more reliable than root for goal distance)
                 torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso")
@@ -171,6 +189,13 @@ def run(args):
                 prev_goal_dist = np.linalg.norm(prev_root_pos[:2] - np.array([0.0, goal_y]))
                 goal_distance = np.linalg.norm(torso_pos[:2] - np.array([0.0, goal_y]))
                 
+                # Calculate tracking rewards
+                vx_ref = 0.5  # Desired forward velocity (matching training)
+                vy_ref = 0.0
+                wz_ref = 0.0
+                lin_vel_tracking = np.exp(-np.sum(np.square(np.array([vx_ref, vy_ref]) - np.array([vx, vy]))))
+                ang_vel_tracking = np.exp(-np.square(wz_ref - wz))
+                
                 # Goal progress reward
                 goal_progress = prev_goal_dist - goal_distance  # Positive when getting closer
                 goal_reward_weight = 10.0  # Strong incentive to reach goal
@@ -179,13 +204,17 @@ def run(args):
                 # Stability reward
                 stability_height_threshold = 0.5
                 stability_reward_weight = 0.8
-                if root_height_z > stability_height_threshold:
+                if root_height > stability_height_threshold:
                     stability_reward = stability_reward_weight
                 else:
-                    stability_reward = root_height_z / stability_height_threshold * stability_reward_weight
+                    stability_reward = root_height / stability_height_threshold * stability_reward_weight
                 
                 # Base survival reward
                 base_reward = 0.3
+                
+                # Roll/pitch stability reward (higher is better)
+                roll_pitch_reward = 1.0 - (roll**2 + pitch**2) * 0.5  # Normalized to [0,1]
+                roll_pitch_reward = max(0, roll_pitch_reward)  # Ensure non-negative
                 
                 # Combine rewards
                 reward = base_reward + stability_reward + goal_reward
@@ -202,7 +231,7 @@ def run(args):
                 
                 # Check termination
                 fall_threshold = 0.4
-                fall = bool(root_height_z < fall_threshold)
+                fall = bool(root_height < fall_threshold)
                 done = fall or goal_reached
                 
                 # Render scene
@@ -211,7 +240,9 @@ def run(args):
                 # Print step info (every 10 steps)
                 if step % 10 == 0 or done:
                     status = "GOAL!" if goal_reached else ("FALL!" if fall else "")
-                    print(f"Step {step}: Reward={reward:.2f}, Height={root_height_z:.2f}, Goal dist={goal_distance:.2f} {status}")
+                    print(f"Step {step}: Reward={reward:.2f}, Height={root_height:.2f}, Goal dist={goal_distance:.2f} {status}")
+                    print(f"  Roll/Pitch: ({roll:.2f}, {pitch:.2f}), Vel: ({vx:.2f}, {vy:.2f}, {vz:.2f})")
+                    print(f"  Tracking: lin_vel={lin_vel_tracking:.2f}, ang_vel={ang_vel_tracking:.2f}")
                 
                 # Control playback speed
                 time.sleep(1.0 / args.fps)
@@ -241,6 +272,7 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int, default=30, help='Rendering frame rate')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--cuda', action='store_true', help='Use CUDA if available')
+    parser.add_argument('--history_length', type=int, default=1, help='History length to match trained policy')
     args = parser.parse_args()
     
     try:

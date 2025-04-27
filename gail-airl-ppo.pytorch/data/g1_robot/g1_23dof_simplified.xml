@@ -2,6 +2,7 @@
   <compiler angle="radian" meshdir="assets"/>
 
   <option integrator="implicitfast"/>
+  <option gravity="0 0 -9.81" />
 
   <default>
     <default class="g1">
