@@ -3,9 +3,55 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
+import logging
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Set
+
+# Set up logging
+logger = logging.getLogger("G1Env")
 
 # Get base directory for consistent file references
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+@dataclass
+class G1EnvConfig:
+    """Configuration for G1 environment parameters"""
+    # Goal parameters
+    goal_pos: np.ndarray = field(default_factory=lambda: np.array([0.0, -1.0, 0.7]))
+    # goal_pos: np.ndarray = field(default_factory=lambda: np.array([3.0, 0.0, 0.0]))
+    goal_success_threshold: float = 0.25
+    goal_reward_weight: float = 50.0
+    
+    # Stability parameters
+    stability_reward_weight: float = 4.0
+    nominal_height: float = 0.7
+    fall_threshold: float = 0.2
+    early_termination_penalty: float = 10.0
+    
+    # Contact reward
+    contact_reward_weight: float = 1.0
+    
+    # Penalty weights
+    torque_penalty_weight: float = 0.001
+    joint_limit_penalty_weight: float = 0.05
+    forward_lean_penalty_weight: float = 2.0
+    velocity_penalty_weight: float = 0.01
+    
+    # Tracking weights
+    lin_vel_tracking_weight: float = 1.0
+    ang_vel_tracking_weight: float = 1.0
+    height_penalty_weight: float = 1.5
+    pose_similarity_weight: float = 0.5
+    action_rate_penalty_weight: float = 0.01
+    vertical_vel_penalty_weight: float = 1.0
+    roll_pitch_penalty_weight: float = 1.0
+    orientation_penalty_weight: float = 0.0  # absolute tilt penalty weight
+    
+    # Environment parameters
+    frame_skip: int = 5
+    action_scale: float = 0.015
+    episode_length: int = 1000
+    damping_factor: float = 0.98
 
 class G1Env(gym.Env):
     """
@@ -13,35 +59,35 @@ class G1Env(gym.Env):
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, render_mode=None):
-        # Env parameters
-        self.frame_skip = 5
-        # Set goal position for side-step to the right
-        self.goal_pos = np.array([1.5, 0.0, 0.0])  # 1.5m to the right (X-axis)
-        self.goal_success_threshold = 0.25  # 25cm threshold for success
-        self.goal_reward_weight = 5.0  # Weight for goal-directed reward
+    def __init__(self, render_mode=None, config=None):
+        # Initialize configuration
+        self.config = config if config is not None else G1EnvConfig()
         
-        # Updated stability parameters
-        self.stability_reward_weight = 2.0  # Increased weight for stability
-        self.nominal_height = 0.55  # Expected standing height
-        self.fall_threshold = 0.35  # Robot is considered fallen below this height
-        self.early_termination_penalty = 10.0  # Severe penalty for falling
-        
-        # New reward components
-        self.contact_reward_weight = 1.0  # Weight for foot contact
-        self.torque_penalty_weight = 0.001  # Weight for torque penalty
-        self.joint_limit_penalty_weight = 0.05  # Weight for joint limits penalty
-        self.forward_lean_penalty_weight = 2.0  # Penalty for leaning forward/backward
-        self.velocity_penalty_weight = 0.01  # Penalty for excessive velocities
-        
-        # Additional new reward components
-        self.lin_vel_tracking_weight = 1.0  # Weight for linear velocity tracking
-        self.ang_vel_tracking_weight = 1.0  # Weight for angular velocity tracking
-        self.height_penalty_weight = 1.5  # Weight for height penalty
-        self.pose_similarity_weight = 0.5  # Weight for pose similarity
-        self.action_rate_penalty_weight = 0.01  # Weight for action rate penalty
-        self.vertical_vel_penalty_weight = 1.0  # Weight for vertical velocity penalty
-        self.roll_pitch_penalty_weight = 2.0  # Weight for roll/pitch stabilization
+        # Env parameters from config
+        self.frame_skip = self.config.frame_skip
+        self.goal_pos = self.config.goal_pos
+        self.goal_success_threshold = self.config.goal_success_threshold
+        self.goal_reward_weight = self.config.goal_reward_weight
+        self.stability_reward_weight = self.config.stability_reward_weight
+        self.nominal_height = self.config.nominal_height
+        self.fall_threshold = self.config.fall_threshold
+        self.early_termination_penalty = self.config.early_termination_penalty
+        self.contact_reward_weight = self.config.contact_reward_weight
+        self.torque_penalty_weight = self.config.torque_penalty_weight
+        self.joint_limit_penalty_weight = self.config.joint_limit_penalty_weight
+        self.forward_lean_penalty_weight = self.config.forward_lean_penalty_weight
+        self.velocity_penalty_weight = self.config.velocity_penalty_weight
+        self.lin_vel_tracking_weight = self.config.lin_vel_tracking_weight
+        self.ang_vel_tracking_weight = self.config.ang_vel_tracking_weight
+        self.height_penalty_weight = self.config.height_penalty_weight
+        self.pose_similarity_weight = self.config.pose_similarity_weight
+        self.action_rate_penalty_weight = self.config.action_rate_penalty_weight
+        self.vertical_vel_penalty_weight = self.config.vertical_vel_penalty_weight
+        self.roll_pitch_penalty_weight = self.config.roll_pitch_penalty_weight
+        self.orientation_penalty_weight = self.config.orientation_penalty_weight
+        self.action_scale = self.config.action_scale
+        self.episode_length = self.config.episode_length
+        self.damping_factor = self.config.damping_factor
         
         # Default commanded velocities and height (can be updated)
         self.vx_ref = 0.0  # Default target x velocity
@@ -53,11 +99,7 @@ class G1Env(gym.Env):
         self.prev_action = None
         
         # Default joint positions (standing pose)
-        self.default_joint_pos = np.zeros(23)  # Will be set in reset
-        
-        # Environment transition parameters
-        self.action_scale = 0.02  # Reduced action scale for better stability
-        self.episode_length = 500  # Shorter episodes for faster learning
+        self.default_joint_pos = None  # Will be set in reset
         
         # Tracking variables
         self.steps = 0
@@ -84,20 +126,33 @@ class G1Env(gym.Env):
         # Get the actual dimensions from the model
         self.qpos_dim = self.model.nq
         self.qvel_dim = self.model.nv
+        self.obs_dim = self.qpos_dim + self.qvel_dim
+        # Assuming first 7 DOFs are free-floating and the rest are actuated joints
+        self.act_dim = self.qvel_dim - 7
         
-        print(f"Loaded model with qpos dimension: {self.qpos_dim}, qvel dimension: {self.qvel_dim}")
+        logger.info(f"Loaded model with qpos dimension: {self.qpos_dim}, qvel dimension: {self.qvel_dim}")
         
-        # Define action space (joint angle changes) - reduced scale for stability
-        n_dof = 23
+        # For compatibility with training scripts, we need to maintain fixed dimensions
+        # Use fixed dimensions that match expert buffer
+        use_fixed_dims = True
+        
+        if use_fixed_dims:
+            # Fixed dimensions for compatibility with expert buffer
+            obs_dim = 60  # Fixed at 60 to match expert buffer
+            act_dim = 30  # Fixed at 30 to match expert buffer
+            logger.info(f"Using fixed observation dimension: {obs_dim}, action dimension: {act_dim} (for compatibility)")
+        else:
+            # Dynamic dimensions based on model properties
+            obs_dim = self.obs_dim
+            act_dim = self.act_dim
+            logger.info(f"Using dynamic observation dimension: {obs_dim}, action dimension: {act_dim}")
+        
+        # Define action space (scaled to [-1, 1] by convention)
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(n_dof,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32
         )
         
-        # Define observation space based on our trimmed observation (23 joint angles + 23 velocities)
-        # This matches the expert data dimensions
-        obs_dim = 46  # 23 joint angles + 23 velocities
-        print(f"Using observation dimension: {obs_dim} (trimmed to match expert data)")
-        
+        # Define observation space
         high = np.ones(obs_dim, dtype=np.float32) * np.finfo(np.float32).max
         self.observation_space = spaces.Box(
             low=-high, high=high, dtype=np.float32
@@ -115,36 +170,47 @@ class G1Env(gym.Env):
         self.initial_height = None
         
         # Get foot geom IDs for contact detection
-        self.foot_geom_ids = []
-        self.foot_site_ids = []
+        self.foot_geom_ids = set()
+        self.foot_site_ids = set()
         
-        # Find foot contact geoms
-        for i in range(self.model.ngeom):
-            # Try to find foot geoms by name if available
-            if hasattr(self.model, 'geom_names') and i < len(self.model.geom_names):
-                geom_name = str(self.model.geom_names[i])
-                if 'foot' in geom_name or 'ankle' in geom_name:
-                    self.foot_geom_ids.append(i)
-            # Otherwise use heuristics (spheres with small size near the ground)
-            elif self.model.geom_type[i] == 2:  # Type 2 is sphere in MuJoCo
-                if self.model.geom_size[i, 0] < 0.05:  # Small spheres
-                    self.foot_geom_ids.append(i)
+        # Find foot contact geoms by name first
+        foot_keywords = ['foot', 'ankle', 'toe']
+        
+        if hasattr(self.model, 'geom_names'):
+            for i, name in enumerate(self.model.geom_names):
+                name_str = str(name).lower()
+                if any(keyword in name_str for keyword in foot_keywords):
+                    self.foot_geom_ids.add(i)
+                    
+        # If no foot geoms found by name, fall back to heuristics
+        if not self.foot_geom_ids:
+            for i in range(self.model.ngeom):
+                # Use heuristics (spheres with small size near the ground)
+                if self.model.geom_type[i] == 2:  # Type 2 is sphere in MuJoCo
+                    if self.model.geom_size[i, 0] < 0.05:  # Small spheres
+                        self.foot_geom_ids.add(i)
         
         # Use foot site IDs if available
-        for i in range(self.model.nsite):
-            # Try to find by name
-            if hasattr(self.model, 'site_names') and i < len(self.model.site_names):
-                site_name = str(self.model.site_names[i])
-                if 'foot' in site_name or 'ankle' in site_name:
-                    self.foot_site_ids.append(i)
-            else:
-                # Add all sites as potential contact points
-                self.foot_site_ids.append(i)
-            
-        print(f"Found {len(self.foot_geom_ids)} foot contact geoms and {len(self.foot_site_ids)} foot sites")
+        if hasattr(self.model, 'site_names'):
+            for i, name in enumerate(self.model.site_names):
+                name_str = str(name).lower()
+                if any(keyword in name_str for keyword in foot_keywords):
+                    self.foot_site_ids.add(i)
+        
+        logger.info(f"Found {len(self.foot_geom_ids)} foot contact geoms and {len(self.foot_site_ids)} foot sites")
     
     def seed(self, seed=None):
+        """Set random seed"""
         self.np_random.seed(seed)
+        # Reset MuJoCo's internal RNG if available
+        try:
+            mujoco.mj_resetSeed(self.model, self.data, seed)
+        except AttributeError:
+            # Try alternate seeding methods if available
+            if hasattr(mujoco, 'mj_resetData'):
+                # Reset data and then set the seed
+                mujoco.mj_resetData(self.model, self.data)
+        
         return [seed]
     
     def _setup_renderer(self):
@@ -173,27 +239,32 @@ class G1Env(gym.Env):
         # Clip velocities to prevent extreme values
         qvel = np.clip(qvel, -10.0, 10.0)
         
-        # In MJCF, qpos includes:
-        # - 3 values for the root position (x, y, z)
-        # - 4 values for the root orientation (quaternion)
-        # - The rest are joint angles
-        # We only want the joint angles (last 23 elements) to match expert data
-        if len(qpos) > 23:
-            qpos_joints = qpos[-23:]  # Take only the last 23 joint values
-        else:
-            qpos_joints = qpos  # Keep all if already right size
-            
-        # Similarly for qvel
-        if len(qvel) > 23:
-            qvel_joints = qvel[-23:]  # Take only the last 23 velocity values
-        else:
-            qvel_joints = qvel  # Keep all if already right size
+        # Concatenate to get the full state
+        obs = np.concatenate([qpos, qvel]).astype(np.float32)
         
-        # Concatenate to get the full state and convert to float32
-        obs = np.concatenate([qpos_joints, qvel_joints]).astype(np.float32)
+        # Make sure observation matches the expected dimension
+        expected_dim = self.observation_space.shape[0]
+        actual_dim = len(obs)
+        
+        if actual_dim < expected_dim:
+            # If actual dimension is less than expected, pad with zeros
+            padding = np.zeros(expected_dim - actual_dim, dtype=np.float32)
+            obs = np.concatenate([obs, padding])
+            if self.steps == 0:  # Only log once during initialization
+                logger.debug(f"Padded observation from {actual_dim} to {expected_dim} dimensions")
+        elif actual_dim > expected_dim:
+            # If actual dimension is more than expected, truncate
+            obs = obs[:expected_dim]
+            if self.steps == 0:  # Only log once during initialization
+                logger.debug(f"Truncated observation from {actual_dim} to {expected_dim} dimensions")
         
         # Replace any NaN or Inf values with zeros
-        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        if np.any(~np.isfinite(obs)):
+            nan_count = np.sum(np.isnan(obs))
+            inf_count = np.sum(np.isinf(obs))
+            if nan_count > 0 or inf_count > 0:
+                logger.debug(f"Found {nan_count} NaN and {inf_count} Inf values in observation")
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
         
         return obs
         
@@ -202,7 +273,7 @@ class G1Env(gym.Env):
         if seed is not None:
             self.seed(seed)
         
-        # Reset the simulation and preserve root position & orientation from XML
+        # Reset the simulation
         mujoco.mj_resetData(self.model, self.data)
         
         # Increase friction to prevent slipping
@@ -230,12 +301,11 @@ class G1Env(gym.Env):
         self.data.qpos[n_root:] += joint_noise
         
         # Save initial joint positions as default
-        joint_start_idx = self.qpos_dim - 23
-        joint_start_idx = max(7, joint_start_idx)
-        self.default_joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+23].copy()
+        joint_start_idx = min(n_root, self.qpos_dim - self.act_dim)  # More robust indexing
+        self.default_joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+self.act_dim].copy()
         
         # Reset previous action
-        self.prev_action = np.zeros(23)
+        self.prev_action = np.zeros(self.act_dim)
         
         # Forward dynamics to get the simulation into a valid state
         mujoco.mj_forward(self.model, self.data)
@@ -246,12 +316,43 @@ class G1Env(gym.Env):
         # Get observation
         obs = self._get_obs()
         
-        # Return observation and empty info dict
+        # Return observation and empty info dict (Gymnasium API)
         return obs, {}
+    
+    def _check_foot_contacts(self):
+        """Check if any foot is in contact with the ground using precomputed geom IDs"""
+        # Fast contact checking using precomputed foot geom IDs
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            if contact.geom1 in self.foot_geom_ids or contact.geom2 in self.foot_geom_ids:
+                return True
+        
+        # Alternative check using foot sites - check if they're close to the ground
+        if not self.foot_site_ids:
+            return False
+            
+        for site_id in self.foot_site_ids:
+            site_pos = self.data.site_xpos[site_id]
+            if site_pos[2] < 0.1:  # Site is close to ground
+                return True
+                
+        return False
     
     def step(self, action):
         """Step the simulation forward based on the action"""
         self.steps += 1
+        
+        # Ensure action has the right dimension (matches action space)
+        action_space_dim = self.action_space.shape[0]  # Should be 30 for compatibility
+        actual_joints_dim = self.act_dim  # Actual number of actuated joints (22)
+        
+        if len(action) != action_space_dim:
+            # If action is too short, pad with zeros
+            if len(action) < action_space_dim:
+                action = np.concatenate([action, np.zeros(action_space_dim - len(action), dtype=action.dtype)])
+            # If action is too long, truncate
+            else:
+                action = action[:action_space_dim]
         
         # Scale and clip action for stability
         action = np.clip(action, -1.0, 1.0) * self.action_scale
@@ -262,32 +363,30 @@ class G1Env(gym.Env):
         # Calculate action rate penalty if we have a previous action
         action_rate_penalty = 0.0
         if self.prev_action is not None:
-            action_diff = raw_action - self.prev_action
+            # Use actual joint dimensions for action rate penalty
+            action_diff = raw_action[:actual_joints_dim] - self.prev_action
             action_rate_penalty = -self.action_rate_penalty_weight * np.sum(np.square(action_diff))
         
-        # Update previous action for next step
-        self.prev_action = raw_action.copy()
+        # Update previous action for next step (store only the actual joint dimensions)
+        self.prev_action = raw_action[:actual_joints_dim].copy()
         
         # We can only control the actual joint DOFs, not the root position/orientation
         # Skip the first 7 qpos values (3 for position, 4 for quaternion orientation)
-        # and apply action to the last 23 joint values (if model has more)
-        joint_start_idx = self.qpos_dim - 23  # Calculate where the last 23 joints start
-        joint_start_idx = max(7, joint_start_idx)  # Ensure we're at least past the root
-        
-        # Apply actions to the joints
-        n_action = min(len(action), 23)  # We expect 23 actions
+        joint_start_idx = min(7, self.qpos_dim - actual_joints_dim)
         
         # Record root position before simulation for reward calculation
         prev_root_pos = self.data.qpos[:3].copy()
-        prev_joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+n_action].copy()
+        prev_joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+actual_joints_dim].copy()
         
-        # Apply actions with more careful stepping
-        for i in range(n_action):
-            self.data.qpos[joint_start_idx + i] += action[i]
+        # Apply actions to the joints - only use the first actual_joints_dim values
+        # This ensures we only use the number of actions the model can actually handle
+        for i in range(actual_joints_dim):
+            if i < len(action):  # Safety check
+                self.data.qpos[joint_start_idx + i] += action[i]
         
         # Add joint limit constraint to prevent extreme values
         joint_limits = 3.14  # approx pi, reasonable joint limit in radians
-        joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+n_action]
+        joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+actual_joints_dim]
         
         # Store values for joint limit penalty calculation
         upper_limits = np.ones_like(joint_pos) * joint_limits
@@ -300,30 +399,29 @@ class G1Env(gym.Env):
         )
         
         # Apply clipping to enforce joint limits
-        self.data.qpos[joint_start_idx:joint_start_idx+n_action] = np.clip(
-            self.data.qpos[joint_start_idx:joint_start_idx+n_action],
+        self.data.qpos[joint_start_idx:joint_start_idx+actual_joints_dim] = np.clip(
+            self.data.qpos[joint_start_idx:joint_start_idx+actual_joints_dim],
             -joint_limits, joint_limits
         )
 
-        # Run the simulation with smaller steps for better stability
+        # Run the simulation with standard mj_step
         try:
-            for _ in range(self.frame_skip):  # Take more smaller steps 
+            for _ in range(self.frame_skip):
                 # Check if state is valid before stepping
-                if np.any(np.isnan(self.data.qpos)) or np.any(np.isinf(self.data.qpos)):
-                    print("Warning: Invalid state detected (NaN/Inf in qpos)")
+                if np.any(~np.isfinite(self.data.qpos)) or np.any(~np.isfinite(self.data.qvel)):
+                    logger.debug("Invalid state detected (NaN/Inf in state)")
                     # Reset to previous valid state
                     self.data.qpos[:] = np.nan_to_num(self.data.qpos, nan=0.0, posinf=0.0, neginf=0.0)
-                    
-                # Step with smaller timestep for stability
-                mujoco.mj_step2(self.model, self.data)  # Just run kinematics
+                    self.data.qvel[:] = np.nan_to_num(self.data.qvel, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # Step physics with proper damping
+                mujoco.mj_step(self.model, self.data)
                 
                 # Add damping to velocities for stability
-                self.data.qvel[:] *= 0.98  # More damping (was 0.99)
+                self.data.qvel[:] *= self.damping_factor
                 
-                # Run dynamics
-                mujoco.mj_step1(self.model, self.data)
         except Exception as e:
-            print(f"Simulation error: {e}")
+            logger.error(f"Simulation error: {e}")
             # Return early with terminated=True if simulation fails
             return self._get_obs(), -self.early_termination_penalty, True, False, {"error": str(e)}
 
@@ -342,41 +440,28 @@ class G1Env(gym.Env):
         # Extract roll and pitch information for roll/pitch stabilization
         root_quat = self.data.qpos[3:7].copy()
         
-        # Check orientation (we want the robot to remain upright)
-        # Extract quaternion of the root (indices 3,4,5,6)
-        # Convert quaternion to rotation matrix
-        # Simplified method for checking upright orientation:
-        # The 'up' vector in world coordinates is [0,0,1]
-        # When transformed by the rotation, we want it to remain mostly vertical
-        
         # Calculate roll and pitch from quaternion
-        # This is a simplified approach to extract approximate roll and pitch
         w, x, y, z = root_quat
         roll = np.arctan2(2.0 * (w*x + y*z), 1.0 - 2.0 * (x*x + y*y))
         pitch = np.arcsin(2.0 * (w*y - z*x))
         
-        # Check if we have the quaternion to matrix conversion function
+        # Get upright alignment from quaternion
+        upright_alignment = 1.0 - 2.0 * (x*x + y*y)  # Simplified dot product calculation
+        
+        # Check for quaternion to matrix conversion
         if hasattr(mujoco, 'mju_quat2Mat'):
             rot_mat = np.zeros(9, dtype=np.float64)
             mujoco.mju_quat2Mat(rot_mat, root_quat)
-            
             # Extract the z-axis (up vector) from rotation matrix
             up_vector = rot_mat[6:9]  # last column of rotation matrix
-            
             # Compute dot product with world up [0,0,1]
-            # (should be close to 1 if robot is upright)
             upright_alignment = up_vector[2]  # z component should be close to 1
-        else:
-            # Simplified check using just the quaternion
-            # This assumes the identity orientation has the z-axis aligned with world up
-            w, x, y, z = root_quat
-            upright_alignment = 1.0 - 2.0 * (x*x + y*y)  # simplified dot product calculation
             
-        # Get position of the torso/body (more reliable than root for goal distance)
+        # Get position of the torso/body
         torso_id = -1
         for i in range(self.model.nbody):
             if hasattr(self.model, 'body_names'):
-                # Check if body_names attribute exists (newer MuJoCo versions)
+                # Check by name
                 if "torso" in str(self.model.body_names[i]):
                     torso_id = i
                     break
@@ -394,25 +479,10 @@ class G1Env(gym.Env):
             # Fallback to root position if torso not found
             torso_pos = root_pos
             
-        # Check foot contacts - at least one foot should be on the ground
-        foot_contact = False
+        # Check foot contacts using the optimized method
+        foot_contact = self._check_foot_contacts()
         
-        # Check for contacts
-        for i in range(self.data.ncon):
-            contact = self.data.contact[i]
-            if contact.geom1 in self.foot_geom_ids or contact.geom2 in self.foot_geom_ids:
-                foot_contact = True
-                break
-        
-        # Alternative check using foot sites - check if they're close to the ground
-        if not foot_contact and len(self.foot_site_ids) > 0:
-            for site_id in self.foot_site_ids:
-                site_pos = self.data.site_xpos[site_id]
-                if site_pos[2] < 0.1:  # Site is close to ground
-                    foot_contact = True
-                    break
-                    
-        # NEW REWARD COMPONENTS:
+        # Calculate rewards and penalties
         
         # 1. Linear Velocity Tracking Reward
         vxy_ref = np.array([self.vx_ref, self.vy_ref])
@@ -428,37 +498,36 @@ class G1Env(gym.Env):
         height_penalty = -self.height_penalty_weight * np.square(root_height - self.z_ref)
         
         # 4. Pose Similarity Reward
-        current_joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+n_action].copy()
+        current_joint_pos = self.data.qpos[joint_start_idx:joint_start_idx+actual_joints_dim].copy()
         pose_similarity_penalty = -self.pose_similarity_weight * np.sum(np.square(current_joint_pos - self.default_joint_pos))
         
-        # 5. Action Rate Penalty was calculated earlier
-        
-        # 6. Vertical Velocity Penalty 
+        # 5. Vertical Velocity Penalty 
         vertical_vel_penalty = -self.vertical_vel_penalty_weight * np.square(vz)
         
-        # 7. Roll and Pitch Stabilization Penalty
+        # 6. Roll and Pitch Stabilization Penalty
         roll_pitch_penalty = -self.roll_pitch_penalty_weight * (np.square(roll) + np.square(pitch))
+        orientation_penalty = -self.orientation_penalty_weight * (abs(roll) + abs(pitch))
         
-        # Calculate velocity penalty (discourage excessive velocities)
+        # 7. Velocity penalty (discourage excessive velocities)
         velocity_penalty = -self.velocity_penalty_weight * np.sum(np.square(self.data.qvel))
                     
-        # Calculate contact reward (only if robot is upright)
+        # 8. Contact reward (only if robot is upright)
         contact_reward = self.contact_reward_weight if foot_contact and upright_alignment > 0.8 else 0.0
             
-        # Calculate torque penalty (based on action magnitude)
+        # 9. Torque penalty (based on action magnitude)
         torque_penalty = -self.torque_penalty_weight * np.sum(np.square(raw_action))
         
-        # Calculate joint limit penalty
+        # 10. Joint limit penalty
         joint_limit_penalty = -self.joint_limit_penalty_weight * joint_limit_violations
         
-        # Forward lean penalty (we want the robot to stay upright)
+        # 11. Forward lean penalty (we want the robot to stay upright)
         lean_penalty = -self.forward_lean_penalty_weight * (1.0 - upright_alignment)**2
         
-        # Compute reward based on multiple components
-        # 1. Base survival reward (for staying alive)
+        # Compute overall reward based on all components
+        # Base survival reward (for staying alive)
         reward = 0.3
         
-        # 2. Stability reward (using quadratic penalty for dropping below threshold)
+        # Stability reward (using quadratic penalty for dropping below threshold)
         z0 = self.nominal_height
         height_diff = max(0, z0 - root_height)
         stability_reward = -self.stability_reward_weight * (height_diff ** 2)
@@ -469,7 +538,7 @@ class G1Env(gym.Env):
         
         reward += stability_reward
         
-        # 3. Goal-reaching reward - only if robot is upright
+        # Goal-reaching reward - only if robot is upright
         if upright_alignment > 0.8:
             goal_distance = np.linalg.norm(torso_pos[:2] - self.goal_pos[:2])
             
@@ -493,21 +562,24 @@ class G1Env(gym.Env):
         
         reward += goal_reward
         
-        # 4. Add contact, lean, velocity, torque and joint limit components
-        reward += contact_reward
-        reward += lean_penalty
-        reward += velocity_penalty  
-        reward += torque_penalty
-        reward += joint_limit_penalty
+        # Add all other reward components
+        reward_components = [
+            contact_reward,
+            lean_penalty,
+            velocity_penalty,
+            torque_penalty,
+            joint_limit_penalty,
+            lin_vel_tracking_reward,
+            ang_vel_tracking_reward,
+            height_penalty,
+            pose_similarity_penalty,
+            action_rate_penalty,
+            vertical_vel_penalty,
+            roll_pitch_penalty,
+            orientation_penalty
+        ]
         
-        # 5. Add new reward components
-        reward += lin_vel_tracking_reward
-        reward += ang_vel_tracking_reward
-        reward += height_penalty
-        reward += pose_similarity_penalty
-        reward += action_rate_penalty
-        reward += vertical_vel_penalty
-        reward += roll_pitch_penalty
+        reward += sum(reward_components)
 
         # Check for goal success (robot is close enough to goal AND upright)
         goal_success = goal_distance < self.goal_success_threshold and upright_alignment > 0.8
@@ -544,6 +616,7 @@ class G1Env(gym.Env):
             'penalty_action_rate': action_rate_penalty,
             'penalty_vertical_vel': vertical_vel_penalty,
             'penalty_roll_pitch': roll_pitch_penalty,
+            'penalty_orientation': orientation_penalty,
             'root_height': root_height,
             'upright_alignment': upright_alignment,
             'torso_pos': torso_pos,
@@ -554,7 +627,9 @@ class G1Env(gym.Env):
             'linear_velocity': np.array([vx, vy, vz]),
             'angular_velocity': np.array([wx, wy, wz]),
             'roll': roll,
-            'pitch': pitch
+            'pitch': pitch,
+            'is_truncated': truncated,
+            'is_terminated': terminated
         }
         
         # Render if in human mode
@@ -590,45 +665,40 @@ class G1Env(gym.Env):
             glfw.terminate()
             self.viewer = None
 
-class GymCompatibilityWrapper:
+class GymCompatibilityWrapper(gym.Wrapper):
     """Wrapper to handle API differences between the old Gym and new Gymnasium"""
     def __init__(self, env):
-        self.env = env
-        self.observation_space = env.observation_space
-        self.action_space = env.action_space
+        super().__init__(env)
         # Add max episode steps for compatibility with PPO
         self._max_episode_steps = env.episode_length if hasattr(env, 'episode_length') else 1000
-        # Expose the unwrapped environment
-        self.unwrapped = env
         
     def reset(self, **kwargs):
         """Handle both old and new gym APIs"""
         result = self.env.reset(**kwargs)
-        # New Gymnasium API returns (obs, info)
+        # Gymnasium API returns (obs, info)
         if isinstance(result, tuple) and len(result) == 2:
-            return result  # Just return the (obs, info) tuple
+            return result
         # Old Gym API returns just obs
-        return result, {}  # Return (obs, {}) for compatibility
-        
+        return result, {}
+    
     def step(self, action):
         """Handle both old and new gym APIs"""
         result = self.env.step(action)
-        # New Gymnasium API returns (obs, reward, terminated, truncated, info)
+        # Make sure we're returning (obs, reward, terminated, truncated, info)
         if len(result) == 5:
             return result
         # Old Gym API returns (obs, reward, done, info)
         obs, reward, done, info = result
-        return obs, reward, done, False, info  # Return (obs, reward, terminated, truncated, info)
-        
-    def render(self, mode="human"):
-        """Handle both old and new gym render APIs"""
-        try:
-            return self.env.render()
-        except TypeError:
-            return self.env.render(mode=mode)
-            
-    def close(self):
-        return self.env.close()
+        return obs, reward, done, False, info
+    
+    def seed(self, seed=None):
+        """Set random seed for environment"""
+        if hasattr(self.env, 'seed'):
+            return self.env.seed(seed)
+        # For Gymnasium compatibility
+        logger.info(f"Using reset(seed={seed}) instead of seed() method")
+        self.reset(seed=seed)
+        return [seed]
 
 def make_g1_env(**kwargs):
     """Create a custom configured G1 environment with appropriate parameters.
@@ -637,69 +707,104 @@ def make_g1_env(**kwargs):
     - Goal distance: 3.0 meters
     - Strong upright orientation reward
     - Appropriate time limits for the 3m goal
+    
+    Args:
+        render_mode (str): 'human' for rendering, None for headless
+        seed (int): Random seed for reproducibility
+        fixed_dims (bool): If True, use fixed dimensions to match expert buffer
+        **kwargs: Additional keyword arguments for G1EnvConfig
+    
+    Returns:
+        GymCompatibilityWrapper: A wrapped G1 environment
     """
+    # Try to import and use the official G1 gym environment if available
     try:
         import gym
         import g1_gym
-    except ImportError:
-        print("G1 Gym environment not found, using direct G1Env implementation")
-        # Use direct G1Env implementation
-        env = GymCompatibilityWrapper(G1Env(render_mode=kwargs.get('render_mode', None)))
+        logger.info("Using official G1 Gym environment")
+        
+        # Create the environment with default settings
+        env = gym.make('G1Raw-v0', render_mode=kwargs.get('render_mode', None))
         
         # Set the goal distance to 3.0 meters
-        if hasattr(env.unwrapped, 'goal_pos'):
-            print(f"Setting goal distance to 3.0 meters")
-            env.unwrapped.goal_pos = np.array([3.0, 0.0, 0.0])  # 3.0m to the right (X-axis)
+        if hasattr(env.unwrapped, 'goal_distance'):
+            logger.info(f"Setting goal distance to 3.0 meters (previously {env.unwrapped.goal_distance})")
+            env.unwrapped.goal_distance = 3.0
         
         # Increase upright orientation reward weight if available
-        if hasattr(env.unwrapped, 'forward_lean_penalty_weight'):
-            env.unwrapped.forward_lean_penalty_weight = 2.0
-            print(f"Setting upright penalty weight to 2.0")
+        if hasattr(env.unwrapped, 'upright_weight'):
+            prev_weight = env.unwrapped.upright_weight
+            env.unwrapped.upright_weight = 0.5  # Stronger weight for upright orientation
+            logger.info(f"Setting upright orientation weight to 0.5 (previously {prev_weight})")
         
-        # Increase time limit for the 3-meter goal
+        # Ensure max episode steps is set
         if hasattr(env, '_max_episode_steps'):
             env._max_episode_steps = 1000  # Increased time limit for 3m navigation
-            print(f"Setting max episode steps to 1000")
+            logger.info(f"Setting max episode steps to 1000")
         
         return env
-    
-    # Create the environment with default settings (original code for when g1_gym is available)
-    env = gym.make('G1Raw-v0', **kwargs)
-    
-    # Set the goal distance to 3.0 meters
-    if hasattr(env.unwrapped, 'goal_distance'):
-        print(f"Setting goal distance to 3.0 meters (previously {env.unwrapped.goal_distance})")
-        env.unwrapped.goal_distance = 3.0
-    
-    # Increase upright orientation reward weight if available
-    if hasattr(env.unwrapped, 'upright_weight'):
-        prev_weight = env.unwrapped.upright_weight
-        env.unwrapped.upright_weight = 0.5  # Stronger weight for upright orientation
-        print(f"Setting upright orientation weight to 0.5 (previously {prev_weight})")
-    
-    # Increase time limit for the 3-meter goal if needed
-    if hasattr(env, 'max_episode_steps'):
-        env._max_episode_steps = 1000  # Increased time limit for 3m navigation
-        print(f"Setting max episode steps to 1000")
-    
-    print(f"G1 environment created with 3.0m goal distance and enhanced upright orientation reward")
-    return env
+        
+    except ImportError:
+        logger.info("G1 Gym environment not found, using direct G1Env implementation")
+        
+        # Create a config with default settings, overridden by any kwargs
+        config = G1EnvConfig()
+        
+        # Override config with any provided kwargs that match config attributes
+        for key, value in kwargs.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+        
+        # Always set goal position consistently
+        config.goal_pos = np.array([0.0, -1.0, 0.7])  # 3.0m to the side (Y-axis)
+        logger.info(f"Setting goal distance to 3.0 meters (Y-axis)")
+        
+        # Use direct G1Env implementation
+        env = G1Env(render_mode=kwargs.get('render_mode', None), config=config)
+        
+        # Wrap for compatibility if needed
+        wrapped_env = GymCompatibilityWrapper(env)
+        
+        return wrapped_env
 
 # For testing the environment directly
 if __name__ == "__main__":
-    env = make_g1_env()
-    obs = env.reset()
-    print(f"Initial observation shape: {obs.shape}")
+    # Set up console logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler()]
+    )
     
-    for _ in range(5):
+    # Create environment with specified parameters
+    env = make_g1_env(
+        render_mode=None,
+        stability_reward_weight=4.0,
+        forward_lean_penalty_weight=2.0
+    )
+    
+    # Reset with a specific seed
+    seed = 42
+    obs, info = env.reset(seed=seed)
+    logger.info(f"Initial observation shape: {obs.shape}")
+    logger.info(f"Action space: {env.action_space}")
+    
+    total_reward = 0
+    episode_length = 0
+    
+    for i in range(100):
         action = env.action_space.sample()
-        obs, reward, done, info = env.step(action)
-        print(f"Action shape: {action.shape}")
-        print(f"Observation shape: {obs.shape}")
-        print(f"Reward: {reward}")
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        episode_length += 1
         
-        if done:
+        if (i + 1) % 20 == 0:
+            logger.info(f"Step {i+1}: Reward={reward:.3f}, Total={total_reward:.3f}")
+        
+        if terminated or truncated:
+            logger.info(f"Episode ended after {episode_length} steps with total reward {total_reward:.3f}")
+            logger.info(f"Reason: {'Success' if info.get('goal_success', False) else 'Fall' if info.get('fall', False) else 'Timeout'}")
             break
             
     env.close()
-    print("Environment test completed.") 
+    logger.info("Environment test completed.") 
